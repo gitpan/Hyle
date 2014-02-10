@@ -11,8 +11,9 @@ use DBIx::Class;
 use Package::Stash;
 use Carp qw(croak carp);
 use attributes qw();
+use URI::Escape;
 
-our $VERSION = '0.1';
+our $VERSION = '0.2';
 
 sub __jsonp_method {
     my ($self,$req,$resultset,$rs,$jsonp_method_name,@args) = @_;
@@ -28,10 +29,13 @@ sub __jsonp_method {
         unless $object;
 
     my $result_source_class  = $rs->result_source->result_class;
-    my $jsonp_method_coderef = $object->can($jsonp_method_name);
+    my $overrides            = $self->override;
+    my $jsonp_method_coderef = exists $overrides->{$resultset}{$jsonp_method_name} || $object->can($jsonp_method_name);
 
-    if ( __method_is_jsonp($jsonp_method_coderef) ) {
-        # method has a 'JSONP' attribute.
+    if ( !$object->can($jsonp_method_name)
+        # if jsonp method is defined in the overrides, we don't care if it has the 'JSONP' subroutine attribute
+        || __method_is_jsonp($jsonp_method_coderef) ) {
+        # method has a 'JSONP' attribute, and was declared in the result source class
         my @ret;
         eval {
             @ret = $object->$jsonp_method_name(%params);
@@ -43,7 +47,7 @@ sub __jsonp_method {
                $err,
                join ",", map { "$_=>$params{$_}" } keys %params;
 
-               return $req->new_response(500); # internal server error
+            return $req->new_response(500); # internal server error
         };
         
         my $resp = $req->new_response(204); # ok, no content
@@ -53,6 +57,7 @@ sub __jsonp_method {
             my ($content_type, $data) = $self->serializer($req)->(\@ret);
             $resp->body($data);
             $resp->content_type($content_type);
+            $resp->content_length(length($data));
 
             return $resp;
         }
@@ -61,6 +66,7 @@ sub __jsonp_method {
         return $req->new_response(501); #not implemented
     }
 
+    return;
 }
 
 sub __method_is_jsonp { return grep { $_ eq 'JSONP' } attributes::get($_[0]) }
@@ -68,17 +74,21 @@ sub __method_is_jsonp { return grep { $_ eq 'JSONP' } attributes::get($_[0]) }
 
 my %jsonp_methods_cache;
 sub __get_jsonp_methods_info2response {
-    my ($result_source) = @_;
+    my ($self,$resultset_name,$result_class) = @_;
 
-    my $methods = $jsonp_methods_cache{$result_source} ||= do {
-        my $p = Package::Stash->new($result_source);
+    my $methods = $jsonp_methods_cache{$result_class} ||= do {
+        my $p = Package::Stash->new($result_class);
 
         my @methods;
         for my $method ( $p->list_all_symbols("CODE") ) {
-            my $coderef = $result_source->can($method);
+            my $coderef = $result_class->can($method);
             next unless $coderef;
             push @methods, $method if __method_is_jsonp($coderef);
         }
+
+        # add the overrides
+        my $overrides = $self->override && exists $self->override->{$resultset_name} ? $self->override->{$resultset_name} : {};
+        push @methods, grep { $_ !~ /^(GET|POST|HEAD|PUT|DELETE)$/ } keys %$overrides;
 
         \@methods;
     };
@@ -90,7 +100,7 @@ sub __HEAD {
     my $self = shift;
     my $res = $self->__GET(@_);
 
-    $res->body(undef) if $res->status == 404;
+    $res->body(undef) if $res->status == 200;
     return $res;
 }
 
@@ -110,7 +120,7 @@ sub __GET {
     my $response = Plack::Response->new();
     if ( @ret ) {
         $response->status(200);
-        if ( my @jsonp_method_definitions = __get_jsonp_methods_info2response($rs->result_source->result_class)) {
+        if ( my @jsonp_method_definitions = $self->__get_jsonp_methods_info2response($resultset,$rs->result_source->result_class)) {
             $_->{__jsonp_methods} = \@jsonp_method_definitions for @ret;
         }
 
@@ -137,12 +147,7 @@ sub __POST {
     my $res     = $rs->find_or_new($params);
     my $resp    = $req->new_response(200);
 
-    # are the updetes on post enabled?
-    if ( $res->in_storage() && $self->allow_post_updates ) {
-        $res->update();
-        return $resp;
-    }
-    elsif ( $res->in_storage() ) {
+    if ( $res->in_storage() ) {
         $resp->status(409); # conflict
         return $resp;
     }
@@ -172,6 +177,32 @@ sub __DELETE {
     return $req->new_response(200);
 }
 
+sub __PUT {
+    my ( $self, $req, $resultset, $rs, @args ) = @_;
+
+    my $body_params = $req->body_parameters;
+    my $params      = ref($body_params) && $body_params->isa("Hash::MultiValue") 
+                      ? $body_params->as_hashref 
+                      : $body_params;
+
+    if ( $req->headers->header("Content-Type") eq "application/x-www-form-urlencoded"
+        && $req->content ) {
+        %$params = map { split "=", $_ } split "&", URI::Escape::uri_unescape($req->content);
+    }
+    elsif ($req->query_parameters) {
+        $params = $req->query_parameters;
+    }
+
+    my ($primary) = $rs->result_source->primary_columns();
+    my $obj = $rs->search({ $primary => (@args?$args[0] : $params->{$primary})})->first();
+
+    return $req->new_response(404) unless $obj;
+
+    $obj->update($params);
+
+    return $req->new_response(200);
+}
+
 our $rest2subref;
 sub _rest2subref {
     my ($self,$req,$resultset) = @_;
@@ -181,14 +212,14 @@ sub _rest2subref {
         my $rs    = $self->schema->resultset($resultset);
         my $class = $rs->result_source->result_class;
 
-        if ( my $coderef = $class->can($method) ) {
-            return $coderef;
-        }
-        elsif ( my $overrides = $self->override ) {
+        if ( my $overrides = $self->override ) {
             croak "override parameter must be a hashref"
                 unless ref $overrides eq 'HASH';
             my $coderef = $overrides->{$resultset}{$method} || $overrides->{$method};
             return $coderef if $coderef;
+        }
+        elsif ( my $coderef = $class->can($method) ) {
+            return $coderef;
         }
 
         my $p = Package::Stash->new(__PACKAGE__);
@@ -225,12 +256,12 @@ sub call {
     my @args = ($args =~ /,/ ? (split ",", $args) : $args);
 
     if ( (my $rs = $self->schema->resultset($resultset))
-        && (!$self->result_sources || exists$self->result_sources->{$resultset})) {
+        && (!$self->result_sources || exists $self->result_sources->{$resultset})) {
 
         # parameter validation
-        if ( $self->validator && (my $params = $req->body_parameters) ) {
-            my $ret = $self->validator->check_params($resultset,$req);
-            unless ($ret) {
+        if ( my $validator = $self->validator ) {
+            croak "Validator parameter to Hyle object must be a subref" unless ref($validator) eq 'CODE';
+            if (!$validator->($req)) {
                 # bad request/unprocessable entity
                 return $req->new_response(422);
             }
@@ -256,6 +287,7 @@ sub call {
             $response = $dispatch_method->($self,$req,$resultset,$rs,@args);
         }
 
+        $response->content_length(length($response->body)) if $response->body;       
         return $response->finalize;
     }
     else {
@@ -282,17 +314,19 @@ WARNING: This is APLHA quality software.
 
     # cpanm Hyle
 
-    # hyle.pl  --dsn'dbi::SQLite::dbname=file.db' --username=... --password= ....
+    # echo "CREATE TABLE cds (id int not null, title varchar);" | sqlite3 /tmp/foo.db
 
-    # curl http://localhost:8000/collection/id/7
+    # hyle.pl  --dsn'dbi::SQLite::dbname=/tmp/foo.db'
+    # HTTP::Server::PSGI: Accepting connections at http://0:5000/
+    # ...
 
+    # curl -X PUT --data'id:1&=title=someTitle' http://localhost:5000/cds/
 
-    # curl -X DELETE ...
+    # curl http://localhost:5000/cds/id/7
 
-    # .... 
-    #
+    # curl -X GET,DELETE,POST
+
     # more configuration 
-    
     my $schema = DBIx::Class->connect(...);
 
     my $app = Hyle->new(
@@ -300,27 +334,29 @@ WARNING: This is APLHA quality software.
         ... other options ...
     );
 
-    # make a custom mount with plack::builder ....
+    # make a custom mount with Plack::Builder
 
     builder {
         mount => "/somewhere" => $app;
         mount => /somethingElse" => $other_app;
     };
 
-    
 
-=head1 HTTP Methods
+=head1 Default REST methods implementations for
 
 =head2 GET
 
-=head2 POST - update/create
+=head2 POST 
+
+=head2 PUT
 
 =head2 DELETE
 
 =head2 HEAD 
 
-
 =head1 OBJECT ATTRIBUTES
+
+The Hyle object can be provided a number of attributes, they're all in the format of : hashkey => HASHREF. All of those parameters are optional.
 
 =head3 serializers
 
@@ -329,7 +365,7 @@ WARNING: This is APLHA quality software.
         ...,
     );
 
-defaults to 'data/json', response content type and JSON::encode_json serialization function.
+defaults to 'data/json', response content type and JSON::encode_json serialization function if no serializers are provided.
 
 =head3 override
 
@@ -338,9 +374,17 @@ defaults to 'data/json', response content type and JSON::encode_json serializati
         ...,
     );
 
-allows overriding particular methods.
+allows overriding of default actions per resultset.
 
-if the class itself implements the __GET() __POST() __DELETE etc., methods, those will be invoked first, then followed by the check for an appropriate method in the %overrides hash, if no method is found, the default ( Hyle::__GET, etc.) implementation will be used.
+You can also subclass the Hyle class or provide default REST methods overrides in particular ResultSource class.
+
+The app is going to try the following things when looking for an appropriate REST method implementation to dispatch to or a given resultset/ database table.
+
+if the ResultSource class itself implements the __GET() __POST() __DELETE etc., methods, those will be invoked first, then followed by the check for an appropriate method in the %overrides hash, if no method is found, the default ( Hyle::__GET, etc.) implementation will be used.
+
+=head3 validator
+
+This optional subroutine reference receives a Plack::Request object and is expected to return either true or false, which determines whether a given request is to be handled or refused.
 
 =head3 result_sources
 
@@ -352,42 +396,49 @@ if the class itself implements the __GET() __POST() __DELETE etc., methods, thos
 
 Expose only the following result sources in the api.
 
-=head3 allow_post_updates
-
-If true, the POST will either create or update an existing resource. It's false by default, on conflict with an existing respource, a 409 HTTP response is returned.
-
 =head2 Support for JSONP
 
-this module is able to include information about potential methods of a result source, or any other subref implementing it.
+It's possible to add code that will be handled as jsonp call, i.e.:
 
-i.e.
+    my $jsonp_method = sub {
+        my ($self,$req,$resultset,$rs,$jsonp_method_name,@args) = @_;
 
-my $jsonp_method :JSONP = sub {
-    my ($self,$req,$resultset,$rs,$jsonp_method_name,@args) = @_;
+        $rs->search_where({
+            column => { -in => [ \@args ] },
+        });
 
-    $rs->search_where({
-        column => { -in => [ \@args ] },
-    });
+        # ....
+        my $response = $req->new_response(200);
+        $response->body( $self->serializer( ... ) );
+    };
 
-    # ....
-    my $response = $req->new_response(200);
-    $response->body( $self->serializer( ... ) );
-};
+    my $app = Hyle->new(
+        schema   => $schema,
+        override => {
+            cds => { jsonp_method_name => $jsonp_method },
+        },
+    );
 
-GET http://localhost:3000/artist/id/7
+The method can also be declared inside of the particulat DBIC ResultSource class. In that case however, the application will only accept methods that have subroutine attribute of 'JSONP", i.e.:
 
-200 OK
+   sub DoSomethhingElse :JSONP {
+        my ($self,$req,$resultset,$rs,$jsonp_method_name,@args) = @_;
+        ...;
+   }
 
-{ "a": 1, "b":2, "__jsonp_methods:["foo"] }
+The application can also advertise jsonp method alongside the data returned by GET requsts.
 
-var someFancyObject = { ...  };
-someFancyObject.foo = function( ) { ... };
+    GET http://localhost:3000/artist/id/7
 
-var ret = someFancyObject.foo({ meh => 1 },{ callback => function() { ... }} );
+    { "a": 1, "b":2, "__jsonp_methods:["foo"] }
 
-POST http://localhost:8000/artist/id/7?jsonp=foo&jsonp_callback=gotData
+    var someFancyObject = { ...  };
 
-foo: 1
+    someFancyObject.foo = function( ) { ... };
+
+    var ret = someFancyObject.foo({ meh => 1 },{ callback => function() { ... }} );
+
+    POST http://localhost:8000/artist/id/7?jsonp=foo&jsonp_callback=gotData
 
 
 =head1 COPYRIGHT AND LICENCE
